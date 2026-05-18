@@ -5,6 +5,7 @@
 export interface AppConfig {
   port: number;
   nodeEnv: string;
+  corsOrigins: string[];
   mongoUri: string;
   redis: {
     host: string;
@@ -21,6 +22,10 @@ export interface AppConfig {
 export default (): AppConfig => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   nodeEnv: process.env.NODE_ENV ?? 'development',
+  corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:3000')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
   mongoUri: process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/tracker',
   redis: {
     host: process.env.REDIS_HOST ?? '127.0.0.1',

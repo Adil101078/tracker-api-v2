@@ -1,7 +1,7 @@
-import { ValidationPipe, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
+import { ValidationPipe, Logger } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -14,14 +14,25 @@ async function bootstrap() {
     }),
   );
 
-  app.setGlobalPrefix('api');
+  app.setGlobalPrefix("api");
   app.enableShutdownHooks();
 
   const config = app.get(ConfigService);
-  const port = config.get<number>('port', 3000);
+  const port = config.get<number>("port", 3000);
+
+  app.enableCors({
+    origin: config.get<string[]>("corsOrigins", ["http://localhost:3002"]),
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    // No allowedHeaders => the cors middleware reflects whatever the
+    // browser sends in Access-Control-Request-Headers during preflight.
+    credentials: true,
+  });
 
   await app.listen(port);
-  Logger.log(`🚀 tracker-api running on http://localhost:${port}/api`, 'Bootstrap');
+  Logger.log(
+    `Tracker-api running on http://localhost:${port}/api`,
+    "Bootstrap",
+  );
 }
 
 bootstrap();
