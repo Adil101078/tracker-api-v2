@@ -6,6 +6,14 @@ import { FilterQuery, Model, PipelineStage } from 'mongoose';
 import constant from '@core/constants';
 import { CreateTrackerDto } from './dto/create-tracker.dto';
 import { Tracker, TrackerDocument } from './schemas/tracker.schema';
+import {
+  CompanySummary,
+  CompanySummaryDocument,
+} from './schemas/company-summary.schema';
+import {
+  HourlyCompanyStats,
+  HourlyCompanyStatsDocument,
+} from './schemas/hourly-company-stats.schema';
 
 export interface StatsQuery {
   companyCode?: string;
@@ -41,7 +49,28 @@ export class TrackerService {
     @InjectQueue(constant.QUEUES.TRACKER) private readonly trackerQueue: Queue,
     @InjectModel(Tracker.name)
     private readonly trackerModel: Model<TrackerDocument>,
+    @InjectModel(CompanySummary.name)
+    private readonly companySummaryModel: Model<CompanySummaryDocument>,
+    @InjectModel(HourlyCompanyStats.name)
+    private readonly hourlyStatsModel: Model<HourlyCompanyStatsDocument>,
   ) {}
+
+  /** Truncate a date to the start of its UTC hour (the cube bucket key). */
+  private static toHourBucket(d: Date): Date {
+    const b = new Date(d);
+    b.setUTCMinutes(0, 0, 0);
+    return b;
+  }
+
+  /**
+   * MongoDB forbids '.' and '$' in stored field names, and we use the
+   * raw value as a map key (endpoints.<key>, countries.<key>). Endpoint
+   * paths normally only contain '/', but be defensive: replace the two
+   * illegal chars so a stray value can never break the $inc path.
+   */
+  private static safeKey(v: string | undefined | null): string {
+    return (v && v.length ? v : 'unknown').replace(/[.$]/g, '_');
+  }
 
   /** Enqueue an api-hit for async geo-enrichment + persistence. */
   async enqueue(dto: CreateTrackerDto): Promise<{ jobId: string }> {
@@ -62,17 +91,130 @@ export class TrackerService {
   async persist(
     data: CreateTrackerDto & Partial<Tracker>,
   ): Promise<TrackerDocument> {
-    return this.trackerModel.create(data);
+    const doc = await this.trackerModel.create(data);
+    await this.bumpCompanySummary(doc);
+    await this.bumpHourlyStats(doc);
+    return doc;
+  }
+
+  /**
+   * Fold one hit into its (company, hour) cube bucket — the structure
+   * that serves every date-filtered dashboard aggregation. One atomic
+   * upsert: flat totals via $inc, the endpoint/status/country breakdowns
+   * via $inc on dotted map paths, firstHit/lastHit via $min/$max.
+   *
+   * Best-effort, same rationale as bumpCompanySummary: the raw row is the
+   * source of truth and the backfill recomputes the cube from it, so a
+   * transient failure here is logged, not fatal.
+   */
+  private async bumpHourlyStats(doc: TrackerDocument): Promise<void> {
+    const createdAt =
+      (doc as { createdAt?: Date }).createdAt ?? new Date();
+    const bucketHour = TrackerService.toHourBucket(createdAt);
+    const hasRt = typeof doc.responseTimeMs === 'number';
+    const rt = hasRt ? doc.responseTimeMs! : 0;
+
+    const epKey = TrackerService.safeKey(doc.endpoint);
+    const statusKey =
+      typeof doc.statusCode === 'number'
+        ? `${Math.floor(doc.statusCode / 100)}xx`
+        : 'unknown';
+    const ccKey = TrackerService.safeKey(doc.countryCode);
+
+    const inc: Record<string, number> = {
+      totalHits: 1,
+      successCount: doc.success === true ? 1 : 0,
+      errorCount: doc.success === false ? 1 : 0,
+      blockedCount: doc.isBlocked === true ? 1 : 0,
+      totalResponseTimeMs: rt,
+      responseTimeSamples: hasRt ? 1 : 0,
+      [`endpoints.${epKey}.hits`]: 1,
+      [`endpoints.${epKey}.successCount`]: doc.success === true ? 1 : 0,
+      [`endpoints.${epKey}.totalResponseTimeMs`]: rt,
+      [`statusBuckets.${statusKey}`]: 1,
+    };
+    // Only record a country breakdown when the hit actually has one,
+    // so hitsByCountry isn't polluted with an "unknown" bucket.
+    if (doc.countryCode) {
+      inc[`countries.${ccKey}.hits`] = 1;
+    }
+
+    try {
+      await this.hourlyStatsModel.updateOne(
+        { companyCode: doc.companyCode, bucketHour },
+        {
+          $inc: inc,
+          $min: { firstHit: createdAt },
+          $max: { lastHit: createdAt },
+          // Store the display label for the country once; harmless to
+          // re-set on every hit (same value), avoids a second write path.
+          ...(doc.countryCode
+            ? { $set: { [`countries.${ccKey}.country`]: doc.country ?? '' } }
+            : {}),
+        },
+        { upsert: true },
+      );
+    } catch (err) {
+      this.logger.error(
+        `HourlyCompanyStats rollup failed for ${doc.companyCode} ` +
+          `@${bucketHour.toISOString()} (hit ${String(doc._id)}): ` +
+          `${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Atomically fold one persisted hit into its company's rollup so the
+   * dashboard never has to $group over the raw collection. A single
+   * upsert with $inc/$min/$max — no read-modify-write, so concurrent
+   * worker writes (TRACKER_QUEUE_CONCURRENCY) can't lose updates.
+   *
+   * Best-effort: a rollup failure must not fail the hit itself (the raw
+   * row is already written and is the source of truth). It's logged so a
+   * drift can be detected and backfilled.
+   */
+  private async bumpCompanySummary(doc: TrackerDocument): Promise<void> {
+    const hasResponseTime = typeof doc.responseTimeMs === 'number';
+    // createdAt comes from Mongoose `timestamps: true`, not the Tracker
+    // class, so it isn't on the static type — read it off the document.
+    const createdAt = (doc as { createdAt?: Date }).createdAt ?? new Date();
+    try {
+      await this.companySummaryModel.updateOne(
+        { companyCode: doc.companyCode },
+        {
+          $inc: {
+            totalHits: 1,
+            successCount: doc.success === true ? 1 : 0,
+            errorCount: doc.success === false ? 1 : 0,
+            totalResponseTimeMs: hasResponseTime ? doc.responseTimeMs! : 0,
+            responseTimeSamples: hasResponseTime ? 1 : 0,
+          },
+          $min: { firstHit: createdAt },
+          $max: { lastHit: createdAt },
+        },
+        { upsert: true },
+      );
+    } catch (err) {
+      this.logger.error(
+        `CompanySummary rollup failed for ${doc.companyCode} ` +
+          `(hit ${String(doc._id)}): ${(err as Error).message}`,
+      );
+    }
   }
 
   /**
    * Distinct company codes — powers the dashboard's "Company Code"
-   * dropdown. Served by the companyCode-leading compound indexes
-   * (covered query, fast even at millions of rows).
+   * dropdown. Reads the rollup collection (one doc per company, a few
+   * hundred at most) instead of running distinct() over the millions of
+   * raw hit rows, which was a full index scan on every dropdown load.
    */
   async listCompanyCodes(): Promise<string[]> {
-    const codes: string[] = await this.trackerModel.distinct('companyCode');
-    return codes.filter(Boolean).sort();
+    const rows = await this.companySummaryModel
+      .find({}, { companyCode: 1, _id: 0 })
+      .sort({ companyCode: 1 })
+      .lean()
+      .exec();
+    return rows.map((r) => r.companyCode).filter(Boolean);
   }
 
   async findRecent(q: StatsQuery & { limit?: number }): Promise<Tracker[]> {
@@ -94,9 +236,18 @@ export class TrackerService {
    * prefix, case-insensitive) and server-side pagination.
    */
   async recentSummary(q: RecentSummaryQuery) {
-    const match = this.buildMatch(q);
+    // Served from the hourly cube, grouped by company over the matched
+    // bucket range. Unlike the old CompanySummary path, the metrics are
+    // now TRUE DATE-RANGE metrics: a from/to filter scopes totals to that
+    // window (hour-precise, see buildCubeMatch), not all-time-per-company.
+    // Still fast: it groups at most (hours-in-range x companies) small
+    // cube docs, never the raw collection.
+    const match = this.buildCubeMatch(q);
     if (q.search) {
-      match.companyCode = { $regex: `^${escapeRegex(q.search)}`, $options: 'i' };
+      match.companyCode = {
+        $regex: `^${escapeRegex(q.search)}`,
+        $options: 'i',
+      };
     }
 
     const page = Math.max(1, q.page ?? 1);
@@ -107,14 +258,13 @@ export class TrackerService {
       {
         $group: {
           _id: '$companyCode',
-          totalHits: { $sum: 1 },
-          successCount: { $sum: { $cond: ['$success', 1, 0] } },
-          errorCount: {
-            $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] },
-          },
-          avgResponseTimeMs: { $avg: '$responseTimeMs' },
-          firstHit: { $min: '$createdAt' },
-          lastHit: { $max: '$createdAt' },
+          totalHits: { $sum: '$totalHits' },
+          successCount: { $sum: '$successCount' },
+          errorCount: { $sum: '$errorCount' },
+          totalResponseTimeMs: { $sum: '$totalResponseTimeMs' },
+          responseTimeSamples: { $sum: '$responseTimeSamples' },
+          firstHit: { $min: '$firstHit' },
+          lastHit: { $max: '$lastHit' },
         },
       },
       {
@@ -122,7 +272,6 @@ export class TrackerService {
           _id: 0,
           companyCode: '$_id',
           totalHits: 1,
-          // hits / span-in-seconds; guard against a single-hit (0s) span.
           avgHitsPerSec: {
             $let: {
               vars: {
@@ -143,12 +292,46 @@ export class TrackerService {
             },
           },
           successRate: {
-            $multiply: [{ $divide: ['$successCount', '$totalHits'] }, 100],
+            $cond: [
+              { $gt: ['$totalHits', 0] },
+              {
+                $multiply: [
+                  { $divide: ['$successCount', '$totalHits'] },
+                  100,
+                ],
+              },
+              0,
+            ],
           },
           errorRate: {
-            $multiply: [{ $divide: ['$errorCount', '$totalHits'] }, 100],
+            $cond: [
+              { $gt: ['$totalHits', 0] },
+              {
+                $multiply: [
+                  { $divide: ['$errorCount', '$totalHits'] },
+                  100,
+                ],
+              },
+              0,
+            ],
           },
-          avgResponseTimeMs: { $round: ['$avgResponseTimeMs', 0] },
+          avgResponseTimeMs: {
+            $cond: [
+              { $gt: ['$responseTimeSamples', 0] },
+              {
+                $round: [
+                  {
+                    $divide: [
+                      '$totalResponseTimeMs',
+                      '$responseTimeSamples',
+                    ],
+                  },
+                  0,
+                ],
+              },
+              0,
+            ],
+          },
           date: '$lastHit',
         },
       },
@@ -164,7 +347,7 @@ export class TrackerService {
       },
     ];
 
-    const [res] = await this.trackerModel.aggregate(pipeline);
+    const [res] = await this.hourlyStatsModel.aggregate(pipeline);
     const total = res?.total?.[0]?.count ?? 0;
     return {
       data: res?.data ?? [],
@@ -188,45 +371,94 @@ export class TrackerService {
     return match;
   }
 
-  /** Top cards: total hits, success/error rate, avg response time, blocked. */
+  /**
+   * $match for the hourly cube. Same companyCode + from/to contract as
+   * buildMatch, but the date range applies to `bucketHour`.
+   *
+   * RANGE PRECISION: the cube is hour-grained, so a hit at 14:37 lives in
+   * the 14:00 bucket. We floor `from` and ceil `to` to hour boundaries so
+   * a partial edge hour is included rather than silently dropped. Net
+   * effect: date filtering is accurate to the hour (an edge query can
+   * include up to ~59min of adjacent data). This is the deliberate
+   * tradeoff for serving any-range queries off rollups instead of a
+   * ~1M-row scan; pass hour-aligned from/to for exact totals.
+   */
+  private buildCubeMatch(
+    q: StatsQuery,
+  ): FilterQuery<HourlyCompanyStatsDocument> {
+    const match: FilterQuery<HourlyCompanyStatsDocument> = {};
+    if (q.companyCode) match.companyCode = q.companyCode;
+    if (q.from || q.to) {
+      const range: Record<string, Date> = {};
+      if (q.from) {
+        const f = new Date(q.from);
+        f.setUTCMinutes(0, 0, 0);
+        range.$gte = f;
+      }
+      if (q.to) {
+        const t = new Date(q.to);
+        // ceil to the end of the to-hour: next hour start, exclusive.
+        t.setUTCMinutes(0, 0, 0);
+        t.setUTCHours(t.getUTCHours() + 1);
+        range.$lt = t;
+      }
+      match.bucketHour = range;
+    }
+    return match;
+  }
+
+  /**
+   * Top cards: total hits, success/error rate, avg response time, blocked.
+   * Served from the hourly cube — sums the flat per-bucket totals instead
+   * of scanning raw hits. avgResponseTimeMs is recovered exactly from the
+   * stored sum/sample-count (not a $avg of per-bucket averages, which
+   * would be wrong since buckets have unequal hit counts).
+   */
   async summary(q: StatsQuery) {
-    const match = this.buildMatch(q);
-    const [row] = await this.trackerModel.aggregate([
-      { $match: match },
+    const [row] = await this.hourlyStatsModel.aggregate([
+      { $match: this.buildCubeMatch(q) },
       {
         $group: {
           _id: null,
-          totalHits: { $sum: 1 },
-          successCount: { $sum: { $cond: ['$success', 1, 0] } },
-          errorCount: {
-            $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] },
-          },
-          blockedCount: { $sum: { $cond: ['$isBlocked', 1, 0] } },
-          avgResponseTimeMs: { $avg: '$responseTimeMs' },
+          totalHits: { $sum: '$totalHits' },
+          successCount: { $sum: '$successCount' },
+          errorCount: { $sum: '$errorCount' },
+          blockedCount: { $sum: '$blockedCount' },
+          totalResponseTimeMs: { $sum: '$totalResponseTimeMs' },
+          responseTimeSamples: { $sum: '$responseTimeSamples' },
         },
       },
     ]);
 
     const totalHits = row?.totalHits ?? 0;
+    const samples = row?.responseTimeSamples ?? 0;
     return {
       totalHits,
       successRate: totalHits ? (row.successCount / totalHits) * 100 : 0,
       errorRate: totalHits ? (row.errorCount / totalHits) * 100 : 0,
       blockedRequests: row?.blockedCount ?? 0,
-      avgResponseTimeMs: Math.round(row?.avgResponseTimeMs ?? 0),
+      avgResponseTimeMs: samples
+        ? Math.round(row.totalResponseTimeMs / samples)
+        : 0,
     };
   }
 
-  /** "Top API Endpoints" table. */
+  /**
+   * "Top API Endpoints" table. Served from the cube's per-bucket
+   * `endpoints` map: $objectToArray turns { "/search": {...} } into rows,
+   * then we re-sum each endpoint's per-bucket sub-totals across the range.
+   */
   async topEndpoints(q: StatsQuery, limit = 10) {
-    return this.trackerModel.aggregate([
-      { $match: this.buildMatch(q) },
+    return this.hourlyStatsModel.aggregate([
+      { $match: this.buildCubeMatch(q) },
+      { $project: { kv: { $objectToArray: '$endpoints' } } },
+      { $unwind: '$kv' },
       {
         $group: {
-          _id: '$endpoint',
-          hits: { $sum: 1 },
-          avgResponseTimeMs: { $avg: '$responseTimeMs' },
-          successCount: { $sum: { $cond: ['$success', 1, 0] } },
+          _id: '$kv.k',
+          hits: { $sum: '$kv.v.hits' },
+          successCount: { $sum: '$kv.v.successCount' },
+          totalResponseTimeMs: { $sum: '$kv.v.totalResponseTimeMs' },
         },
       },
       {
@@ -234,9 +466,24 @@ export class TrackerService {
           _id: 0,
           endpoint: '$_id',
           hits: 1,
-          avgResponseTimeMs: { $round: ['$avgResponseTimeMs', 0] },
+          avgResponseTimeMs: {
+            $cond: [
+              { $gt: ['$hits', 0] },
+              { $round: [{ $divide: ['$totalResponseTimeMs', '$hits'] }, 0] },
+              0,
+            ],
+          },
           successRate: {
-            $multiply: [{ $divide: ['$successCount', '$hits'] }, 100],
+            $cond: [
+              { $gt: ['$hits', 0] },
+              {
+                $multiply: [
+                  { $divide: ['$successCount', '$hits'] },
+                  100,
+                ],
+              },
+              0,
+            ],
           },
         },
       },
@@ -245,41 +492,45 @@ export class TrackerService {
     ]);
   }
 
-  /** "Status Code Distribution" donut. */
+  /**
+   * "Status Code Distribution" donut. Served from the cube's
+   * `statusBuckets` map ({ "2xx": n, ... }) summed across the range.
+   */
   async statusDistribution(q: StatsQuery) {
-    return this.trackerModel.aggregate([
-      { $match: this.buildMatch(q) },
-      {
-        $group: {
-          _id: {
-            $concat: [
-              { $toString: { $floor: { $divide: ['$statusCode', 100] } } },
-              'xx',
-            ],
-          },
-          count: { $sum: 1 },
-        },
-      },
+    return this.hourlyStatsModel.aggregate([
+      { $match: this.buildCubeMatch(q) },
+      { $project: { kv: { $objectToArray: '$statusBuckets' } } },
+      { $unwind: '$kv' },
+      { $group: { _id: '$kv.k', count: { $sum: '$kv.v' } } },
       { $project: { _id: 0, group: '$_id', count: 1 } },
       { $sort: { group: 1 } },
     ]);
   }
 
-  /** "Hits by Country" / Geography. */
+  /**
+   * "Hits by Country" / Geography. Served from the cube's `countries`
+   * map (keyed by countryCode, with the display `country` stored inside).
+   * Hits without geo are never written into the map, so no null filter
+   * is needed.
+   */
   async hitsByCountry(q: StatsQuery, limit = 10) {
-    return this.trackerModel.aggregate([
-      { $match: { ...this.buildMatch(q), country: { $ne: null } } },
+    return this.hourlyStatsModel.aggregate([
+      { $match: this.buildCubeMatch(q) },
+      { $project: { kv: { $objectToArray: '$countries' } } },
+      { $unwind: '$kv' },
       {
         $group: {
-          _id: { country: '$country', countryCode: '$countryCode' },
-          hits: { $sum: 1 },
+          _id: '$kv.k',
+          hits: { $sum: '$kv.v.hits' },
+          // labels are identical per countryCode; $last picks one.
+          country: { $last: '$kv.v.country' },
         },
       },
       {
         $project: {
           _id: 0,
-          country: '$_id.country',
-          countryCode: '$_id.countryCode',
+          countryCode: '$_id',
+          country: 1,
           hits: 1,
         },
       },
@@ -289,20 +540,34 @@ export class TrackerService {
   }
 
   /**
-   * "Traffic Over Time" — hits bucketed at the requested granularity.
-   * UI preset → granularity mapping (do this on the FE or pass directly):
-   *   15m/1H → minute, 6H/24H/7D → hour, 30D/Custom → day.
-   * Defaults to hour. Invalid values fall back to hour.
+   * "Traffic Over Time" — hits bucketed at the requested granularity,
+   * served from the hourly cube by re-bucketing `bucketHour`.
+   *
+   * GRANULARITY: 'hour' and 'day' are exact (the cube's native grain or
+   * coarser). 'minute' CANNOT be served from an hourly cube — the finest
+   * stored resolution is the hour — so a 'minute' request is answered at
+   * hour grain. (Per-minute rollups would 60x the cube; the per-hour
+   * grain was chosen deliberately. For true minute resolution on a small
+   * recent window, query the raw collection instead.) Invalid values
+   * fall back to hour.
    */
   async trafficOverTime(q: StatsQuery, granularity: Granularity = 'hour') {
+    const effective: Granularity =
+      granularity === 'minute' ? 'hour' : granularity;
     const format =
-      GRANULARITY_FORMAT[granularity] ?? GRANULARITY_FORMAT.hour;
-    return this.trackerModel.aggregate([
-      { $match: this.buildMatch(q) },
+      GRANULARITY_FORMAT[effective] ?? GRANULARITY_FORMAT.hour;
+    return this.hourlyStatsModel.aggregate([
+      { $match: this.buildCubeMatch(q) },
       {
         $group: {
-          _id: { $dateToString: { format, date: '$createdAt' } },
-          hits: { $sum: 1 },
+          _id: {
+            $dateToString: {
+              format,
+              date: '$bucketHour',
+              timezone: 'UTC',
+            },
+          },
+          hits: { $sum: '$totalHits' },
         },
       },
       { $project: { _id: 0, bucket: '$_id', hits: 1 } },

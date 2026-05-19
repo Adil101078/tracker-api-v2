@@ -8,11 +8,24 @@ import { TrackerController } from './tracker.controller';
 import { TrackerProcessor } from './tracker.processor';
 import { TrackerService } from './tracker.service';
 import { Tracker, TrackerSchema } from './schemas/tracker.schema';
+import {
+  CompanySummary,
+  CompanySummarySchema,
+} from './schemas/company-summary.schema';
+import {
+  HourlyCompanyStats,
+  HourlyCompanyStatsSchema,
+} from './schemas/hourly-company-stats.schema';
 
 @Module({
   imports: [
     MongooseModule.forFeature([
       { name: Tracker.name, schema: TrackerSchema },
+      { name: CompanySummary.name, schema: CompanySummarySchema },
+      {
+        name: HourlyCompanyStats.name,
+        schema: HourlyCompanyStatsSchema,
+      },
     ]),
     BullModule.registerQueue({ name: constant.QUEUES.TRACKER }),
   ],

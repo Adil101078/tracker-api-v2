@@ -13,6 +13,7 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node -r ./tsconfig-paths-bootstrap.js dist/main",
     "seed": "nest build && node -r ./tsconfig-paths-bootstrap.js dist/seed",
+    "backfill:summary": "nest build && node -r ./tsconfig-paths-bootstrap.js dist/backfill-company-summary",
     "lint": "eslint \"{src,test}/**/*.ts\" --fix",
     "test": "jest"
   },
