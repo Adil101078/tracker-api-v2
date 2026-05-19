@@ -115,6 +115,17 @@ async function run() {
   await trackerModel
     .aggregate(
       [
+        // Drop rows that can't be placed in the cube: a null/absent
+        // createdAt has no hour bucket, and a null companyCode can't be
+        // a $merge key. These are malformed legacy rows; excluding them
+        // matches the live path (which only ever writes well-formed
+        // hits) rather than inventing an "unknown" company/time.
+        {
+          $match: {
+            companyCode: { $type: 'string' },
+            createdAt: { $type: 'date' },
+          },
+        },
         {
           $project: {
             companyCode: 1,
@@ -125,14 +136,24 @@ async function run() {
             countryCode: 1,
             createdAt: 1,
             // Mirror TrackerService.safeKey: strip '.' and '$' from the
-            // endpoint so it's a legal map key. NOTE: a bare '$' string
-            // is parsed by Mongo as a (invalid) field path, so the
-            // dollar literal must be wrapped in $literal.
+            // endpoint so it's a legal map key. $replaceAll ERRORS on a
+            // null input, and $ifNull only catches null/missing (not a
+            // numeric/other type), so first coerce to a guaranteed
+            // string: use $endpoint only when it is actually a string,
+            // else 'unknown'. NOTE: a bare '$' string is parsed by Mongo
+            // as an (invalid) field path, so the dollar literal must be
+            // wrapped in $literal.
             endpointKey: {
               $replaceAll: {
                 input: {
                   $replaceAll: {
-                    input: { $ifNull: ['$endpoint', 'unknown'] },
+                    input: {
+                      $cond: [
+                        { $eq: [{ $type: '$endpoint' }, 'string'] },
+                        '$endpoint',
+                        'unknown',
+                      ],
+                    },
                     find: '.',
                     replacement: '_',
                   },
@@ -141,10 +162,25 @@ async function run() {
                 replacement: '_',
               },
             },
+            // countryKey: '' when there's no usable geo. Pushed as-is and
+            // filtered out before $arrayToObject so the countries map is
+            // never built with a null/empty key (matches the live path,
+            // which only writes a country bucket when countryCode set).
+            countryKey: {
+              $cond: [
+                { $eq: [{ $type: '$countryCode' }, 'string'] },
+                '$countryCode',
+                '',
+              ],
+            },
+            // $type is 'missing' only for ABSENT fields; an explicit
+            // null (or non-numeric) has type 'null'/'string' and would
+            // slip through and make $floor/$toString yield null, which
+            // $arrayToObject rejects as a key. Gate on $isNumber so any
+            // non-numeric statusCode falls back to the 'unknown' bucket.
             statusKey: {
               $cond: [
-                { $eq: [{ $type: '$statusCode' }, 'missing'] },
-                'unknown',
+                { $isNumber: '$statusCode' },
                 {
                   $concat: [
                     {
@@ -155,19 +191,20 @@ async function run() {
                     'xx',
                   ],
                 },
+                'unknown',
               ],
             },
             bucketHour: {
               $dateTrunc: { date: '$createdAt', unit: 'hour' },
             },
-            hasRt: {
-              $cond: [
-                { $eq: [{ $type: '$responseTimeMs' }, 'missing'] },
-                0,
-                1,
-              ],
+            // Same null-slip as statusKey: gate on $isNumber so a
+            // null/non-numeric responseTimeMs isn't counted as a sample
+            // and contributes 0 to the sum (not null, which would
+            // poison $sum).
+            hasRt: { $cond: [{ $isNumber: '$responseTimeMs' }, 1, 0] },
+            rt: {
+              $cond: [{ $isNumber: '$responseTimeMs' }, '$responseTimeMs', 0],
             },
-            rt: { $ifNull: ['$responseTimeMs', 0] },
           },
         },
         // (a) finest grouping: company + hour + endpoint + status + cc
@@ -178,7 +215,7 @@ async function run() {
               bucketHour: '$bucketHour',
               endpointKey: '$endpointKey',
               statusKey: '$statusKey',
-              countryCode: '$countryCode',
+              countryKey: '$countryKey',
             },
             country: { $last: '$country' },
             hits: { $sum: 1 },
@@ -221,7 +258,7 @@ async function run() {
             },
             countryRows: {
               $push: {
-                cc: '$_id.countryCode',
+                cc: '$_id.countryKey',
                 country: '$country',
                 hits: '$hits',
               },
@@ -376,6 +413,46 @@ async function run() {
     `Done in ${((Date.now() - startedAt) / 1000).toFixed(1)}s — ` +
       `${companies} company summary docs, ${buckets} hourly cube docs.`,
   );
+
+  // ---- self-check: cube totalHits must equal a raw count ----
+  // Picks one real company and asserts the cube's summed totalHits
+  // matches a direct countDocuments on the raw collection. A mismatch
+  // means the aggregation lost/duplicated rows — fail loudly rather
+  // than let a silently-wrong cube reach the dashboard.
+  const sample = await summaryModel
+    .findOne({}, { companyCode: 1 })
+    .sort({ totalHits: -1 })
+    .lean();
+  if (sample) {
+    const cc = sample.companyCode;
+    const [rawCount, cubeAgg] = await Promise.all([
+      trackerModel.countDocuments({
+        companyCode: cc,
+        createdAt: { $type: 'date' },
+      }),
+      cubeModel.aggregate<{ total: number }>([
+        { $match: { companyCode: cc } },
+        { $group: { _id: null, total: { $sum: '$totalHits' } } },
+        { $project: { _id: 0, total: 1 } },
+      ]),
+    ]);
+    const cubeTotal = cubeAgg[0]?.total ?? 0;
+    const ok = rawCount === cubeTotal;
+    console.log(
+      `Verify [${cc}]: raw=${rawCount} cube=${cubeTotal} ` +
+        `${ok ? 'OK' : 'MISMATCH'}`,
+    );
+    if (!ok) {
+      console.error(
+        'Cube total does not match raw hit count — the cube is ' +
+          'NOT trustworthy. Do not rely on the dashboard until this ' +
+          'is resolved.',
+      );
+      await app.close();
+      process.exit(2);
+    }
+  }
+
   await app.close();
   process.exit(0);
 }
