@@ -124,6 +124,10 @@ async function run() {
             country: 1,
             countryCode: 1,
             createdAt: 1,
+            // Mirror TrackerService.safeKey: strip '.' and '$' from the
+            // endpoint so it's a legal map key. NOTE: a bare '$' string
+            // is parsed by Mongo as a (invalid) field path, so the
+            // dollar literal must be wrapped in $literal.
             endpointKey: {
               $replaceAll: {
                 input: {
@@ -133,7 +137,7 @@ async function run() {
                     replacement: '_',
                   },
                 },
-                find: '$',
+                find: { $literal: '$' },
                 replacement: '_',
               },
             },
