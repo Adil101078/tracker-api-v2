@@ -229,19 +229,19 @@ export class TrackerService {
   }
 
   /**
-   * "Recent API Hit Summary" table — one row PER COMPANY (not per hit),
+   * "Recent API Hit Summary" table — one row PER COMPANY PER DAY,
    * matching the UI columns: Total Hits, Avg Hits/Sec, Success Rate,
-   * Error Rate, Avg Response Time, Date (last hit). Supports the
-   * companyCode + date filters, the table "Search" box (companyCode
-   * prefix, case-insensitive) and server-side pagination.
+   * Error Rate, Avg Response Time, Date (the calendar day, UTC). Newest
+   * day first. Supports the companyCode + date filters, the table
+   * "Search" box (companyCode prefix, case-insensitive) and server-side
+   * pagination over the company-day rows.
    */
   async recentSummary(q: RecentSummaryQuery) {
-    // Served from the hourly cube, grouped by company over the matched
-    // bucket range. Unlike the old CompanySummary path, the metrics are
-    // now TRUE DATE-RANGE metrics: a from/to filter scopes totals to that
-    // window (hour-precise, see buildCubeMatch), not all-time-per-company.
-    // Still fast: it groups at most (hours-in-range x companies) small
-    // cube docs, never the raw collection.
+    // Served from the hourly cube: buckets matched by the range are
+    // collapsed to (company, day). Metrics are TRUE DATE-RANGE metrics —
+    // a from/to filter scopes which days/hours are included (hour-precise,
+    // see buildCubeMatch). Still fast: groups at most
+    // (hours-in-range x companies) small cube docs, never the raw rows.
     const match = this.buildCubeMatch(q);
     if (q.search) {
       match.companyCode = {
@@ -256,8 +256,17 @@ export class TrackerService {
     const pipeline: PipelineStage[] = [
       { $match: match },
       {
+        // One row PER COMPANY PER DAY: the hourly cube buckets are
+        // collapsed to the calendar day (UTC) they fall in, so the
+        // table shows daily activity per company instead of a single
+        // all-time total per company.
         $group: {
-          _id: '$companyCode',
+          _id: {
+            companyCode: '$companyCode',
+            day: {
+              $dateTrunc: { date: '$bucketHour', unit: 'day' },
+            },
+          },
           totalHits: { $sum: '$totalHits' },
           successCount: { $sum: '$successCount' },
           errorCount: { $sum: '$errorCount' },
@@ -270,7 +279,7 @@ export class TrackerService {
       {
         $project: {
           _id: 0,
-          companyCode: '$_id',
+          companyCode: '$_id.companyCode',
           totalHits: 1,
           avgHitsPerSec: {
             $let: {
@@ -332,10 +341,14 @@ export class TrackerService {
               0,
             ],
           },
-          date: '$lastHit',
+          // The calendar day this row aggregates (what the DATE column
+          // renders), not the last-hit timestamp.
+          date: '$_id.day',
         },
       },
-      { $sort: { date: -1 } },
+      // Newest day first; companyCode as a stable tiebreaker so rows on
+      // the same day have a deterministic order across pages.
+      { $sort: { date: -1, companyCode: 1 } },
       {
         $facet: {
           data: [
