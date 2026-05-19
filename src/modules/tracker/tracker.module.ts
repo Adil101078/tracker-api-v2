@@ -5,6 +5,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import constant from '@core/constants';
 import { TrackingInterceptor } from '@core/interceptors/tracking.interceptor';
 import { TrackerController } from './tracker.controller';
+import { AdminReportController } from './admin-report.controller';
 import { TrackerProcessor } from './tracker.processor';
 import { TrackerService } from './tracker.service';
 import { Tracker, TrackerSchema } from './schemas/tracker.schema';
@@ -29,7 +30,7 @@ import {
     ]),
     BullModule.registerQueue({ name: constant.QUEUES.TRACKER }),
   ],
-  controllers: [TrackerController],
+  controllers: [TrackerController, AdminReportController],
   providers: [
     TrackerService,
     TrackerProcessor,
