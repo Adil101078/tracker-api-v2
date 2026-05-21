@@ -44,10 +44,16 @@ function isNonRoutable(ip: string): boolean {
  * Resolve geolocation for an IP via ip-api.com.
  * Returns null on any failure or for non-routable IPs — callers must
  * treat geo as best-effort and never fail the job because of it.
+ *
+ * DISABLED by default. ip-api.com's free tier rate-limits at ~45 req/min
+ * and was returning 429 Too Many Requests under our ingest load, which
+ * spammed the logs without ever populating geo. Flip GEO_LOOKUP_ENABLED=true
+ * to re-enable (consider adding a throttle / paid key first).
  */
 export default async function getGeoData(
   ip?: string,
 ): Promise<GeoData | null> {
+  if (process.env.GEO_LOOKUP_ENABLED !== 'true') return null;
   if (!ip || isNonRoutable(ip)) return null;
 
   const hit = cache.get(ip);
