@@ -19,6 +19,11 @@ export class TrackerProcessor extends WorkerHost {
 
   constructor(private readonly trackerService: TrackerService) {
     super();
+    // Diagnostic: log the resolved geo flag at startup so a stale build
+    // or unread .env shows up immediately in the boot logs.
+    this.logger.log(
+      `GEO_LOOKUP_ENABLED=${process.env.GEO_LOOKUP_ENABLED ?? '<unset>'}`,
+    );
   }
 
   async process(job: Job<CreateTrackerDto>): Promise<{ id: string }> {
@@ -29,8 +34,10 @@ export class TrackerProcessor extends WorkerHost {
 
     const data = { ...job.data };
 
-    // Best-effort geo enrichment (skipped if already set or no usable IP).
-    if (data.IP && !data.country) {
+    // Geo enrichment: gated at the CALL SITE so a stale build of
+    // get-geo-data.ts can't bypass the flag. Off unless explicitly set.
+    const geoEnabled = process.env.GEO_LOOKUP_ENABLED === 'true';
+    if (geoEnabled && data.IP && !data.country) {
       const geo = await getGeoData(data.IP);
       if (geo) {
         data.country = geo.country;
