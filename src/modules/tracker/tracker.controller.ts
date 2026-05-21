@@ -1,6 +1,7 @@
-import { Controller, Get, Query } from "@nestjs/common";
+import { Controller, Get, Param, Query } from "@nestjs/common";
 import { SkipTracking } from "@core/decorators/skip-tracking.decorator";
 import {
+  CompanyDetailQuery,
   Granularity,
   RecentSummaryQuery,
   StatsQuery,
@@ -17,6 +18,25 @@ export class TrackerController {
   async companies() {
     const data = await this.trackerService.listCompanyCodes();
     return { success: true, count: data.length, data };
+  }
+
+  /**
+   * Company-detail view (/api-tracker/:companyCode). Returns KPI summary,
+   * top route breakdown and a per-bucket (date, route) time-series for
+   * charting — all scoped to one company, optionally filtered by date
+   * range and origin/destination.
+   */
+  @Get("companies/:companyCode")
+  @SkipTracking()
+  async companyDetail(
+    @Param("companyCode") companyCode: string,
+    @Query() q: CompanyDetailQuery,
+  ) {
+    const data = await this.trackerService.companyDetail(companyCode, {
+      ...q,
+      limit: q.limit ? Number(q.limit) : undefined,
+    });
+    return { success: true, ...data };
   }
 
   @Get()

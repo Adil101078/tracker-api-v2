@@ -29,6 +29,15 @@ export interface RecentSummaryQuery extends StatsQuery {
   pageSize?: number;
 }
 
+export interface CompanyDetailQuery {
+  from?: string;
+  to?: string;
+  origin?: string;
+  destination?: string;
+  granularity?: 'day' | 'hour';
+  limit?: number;
+}
+
 /** Maps UI traffic presets / granularity to a $dateToString format. */
 const GRANULARITY_FORMAT: Record<Granularity, string> = {
   minute: '%Y-%m-%dT%H:%M',
@@ -368,6 +377,275 @@ export class TrackerService {
       pageSize,
       total,
       totalPages: Math.ceil(total / pageSize),
+    };
+  }
+
+  /**
+   * Company-detail view: per-route (origin→destination) hit breakdown
+   * for ONE company, plus KPI summary and a daily/hourly time-series
+   * for charting.
+   *
+   * Served from raw `trackers` (origin/destination aren't in the hourly
+   * cube). The {companyCode, createdAt} compound index covers the match;
+   * the date range bounds the scan. One $facet pipeline returns all three
+   * branches in a single round trip.
+   *
+   * Hits without origin OR destination (non-search traffic) are excluded
+   * from the route/series breakdowns so the chart isn't polluted with an
+   * "unknown→unknown" stack; they still count toward `summary` totals.
+   */
+  async companyDetail(companyCode: string, q: CompanyDetailQuery) {
+    const match: FilterQuery<TrackerDocument> = { companyCode };
+    if (q.from || q.to) {
+      match.createdAt = {};
+      if (q.from)
+        (match.createdAt as Record<string, Date>).$gte = new Date(q.from);
+      if (q.to)
+        (match.createdAt as Record<string, Date>).$lte = new Date(q.to);
+    }
+    if (q.origin) match.origin = q.origin;
+    if (q.destination) match.destination = q.destination;
+
+    const granularity: 'day' | 'hour' = q.granularity === 'hour' ? 'hour' : 'day';
+    const limit = Math.min(Math.max(1, q.limit ?? 20), 100);
+
+    // Only rows with BOTH origin and destination feed the route/series
+    // breakdowns. The summary branch sees the full match (all traffic).
+    const routeMatch: FilterQuery<TrackerDocument> = {
+      origin: { $exists: true, $ne: '' },
+      destination: { $exists: true, $ne: '' },
+    };
+
+    const pipeline: PipelineStage[] = [
+      { $match: match },
+      {
+        $facet: {
+          summary: [
+            {
+              $group: {
+                _id: null,
+                totalHits: { $sum: 1 },
+                successCount: {
+                  $sum: { $cond: [{ $eq: ['$success', true] }, 1, 0] },
+                },
+                errorCount: {
+                  $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] },
+                },
+                totalResponseTimeMs: {
+                  $sum: {
+                    $cond: [
+                      { $isNumber: '$responseTimeMs' },
+                      '$responseTimeMs',
+                      0,
+                    ],
+                  },
+                },
+                responseTimeSamples: {
+                  $sum: {
+                    $cond: [{ $isNumber: '$responseTimeMs' }, 1, 0],
+                  },
+                },
+                firstHit: { $min: '$createdAt' },
+                lastHit: { $max: '$createdAt' },
+              },
+            },
+          ],
+          routes: [
+            { $match: routeMatch },
+            // Stage 1: per-(route, day) counts. Day granularity is used
+            // for the `dates` array regardless of `granularity` (which
+            // only controls the top-level `series` bucket size).
+            {
+              $group: {
+                _id: {
+                  origin: '$origin',
+                  destination: '$destination',
+                  day: {
+                    $dateTrunc: { date: '$createdAt', unit: 'day' },
+                  },
+                },
+                dayHits: { $sum: 1 },
+                daySuccess: {
+                  $sum: { $cond: [{ $eq: ['$success', true] }, 1, 0] },
+                },
+                dayResponseTimeMs: {
+                  $sum: {
+                    $cond: [
+                      { $isNumber: '$responseTimeMs' },
+                      '$responseTimeMs',
+                      0,
+                    ],
+                  },
+                },
+                dayResponseSamples: {
+                  $sum: {
+                    $cond: [{ $isNumber: '$responseTimeMs' }, 1, 0],
+                  },
+                },
+              },
+            },
+            // Sort day rows desc so $push preserves latest-first order
+            // when collapsing to the route level.
+            { $sort: { '_id.day': -1 } },
+            // Stage 2: collapse to the route level, carrying the per-day
+            // breakdown along as `dates` (already latest-first).
+            {
+              $group: {
+                _id: {
+                  origin: '$_id.origin',
+                  destination: '$_id.destination',
+                },
+                hits: { $sum: '$dayHits' },
+                successCount: { $sum: '$daySuccess' },
+                totalResponseTimeMs: { $sum: '$dayResponseTimeMs' },
+                responseTimeSamples: { $sum: '$dayResponseSamples' },
+                dates: {
+                  $push: {
+                    date: '$_id.day',
+                    hits: '$dayHits',
+                    successRate: {
+                      $cond: [
+                        { $gt: ['$dayHits', 0] },
+                        {
+                          $multiply: [
+                            { $divide: ['$daySuccess', '$dayHits'] },
+                            100,
+                          ],
+                        },
+                        0,
+                      ],
+                    },
+                    avgResponseTimeMs: {
+                      $cond: [
+                        { $gt: ['$dayResponseSamples', 0] },
+                        {
+                          $round: [
+                            {
+                              $divide: [
+                                '$dayResponseTimeMs',
+                                '$dayResponseSamples',
+                              ],
+                            },
+                            0,
+                          ],
+                        },
+                        0,
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                origin: '$_id.origin',
+                destination: '$_id.destination',
+                hits: 1,
+                dates: 1,
+                successRate: {
+                  $cond: [
+                    { $gt: ['$hits', 0] },
+                    {
+                      $multiply: [
+                        { $divide: ['$successCount', '$hits'] },
+                        100,
+                      ],
+                    },
+                    0,
+                  ],
+                },
+                avgResponseTimeMs: {
+                  $cond: [
+                    { $gt: ['$responseTimeSamples', 0] },
+                    {
+                      $round: [
+                        {
+                          $divide: [
+                            '$totalResponseTimeMs',
+                            '$responseTimeSamples',
+                          ],
+                        },
+                        0,
+                      ],
+                    },
+                    0,
+                  ],
+                },
+              },
+            },
+            { $sort: { hits: -1 } },
+            { $limit: limit },
+          ],
+          // Total distinct (origin, destination) pairs across the range —
+          // independent of `limit`, which only caps the routes list.
+          distinctRoutes: [
+            { $match: routeMatch },
+            {
+              $group: {
+                _id: { origin: '$origin', destination: '$destination' },
+              },
+            },
+            { $count: 'count' },
+          ],
+          series: [
+            { $match: routeMatch },
+            {
+              $group: {
+                _id: {
+                  date: {
+                    $dateTrunc: { date: '$createdAt', unit: granularity },
+                  },
+                  origin: '$origin',
+                  destination: '$destination',
+                },
+                hits: { $sum: 1 },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                date: '$_id.date',
+                origin: '$_id.origin',
+                destination: '$_id.destination',
+                hits: 1,
+              },
+            },
+            { $sort: { date: 1 } },
+          ],
+        },
+      },
+    ];
+
+    const [res] = await this.trackerModel.aggregate(pipeline);
+    const s = res?.summary?.[0];
+    const routes = res?.routes ?? [];
+    const totalHits = s?.totalHits ?? 0;
+    const samples = s?.responseTimeSamples ?? 0;
+
+    return {
+      companyCode,
+      range: { from: q.from ?? null, to: q.to ?? null, granularity },
+      summary: {
+        totalHits,
+        successRate: totalHits ? (s.successCount / totalHits) * 100 : 0,
+        errorRate: totalHits ? (s.errorCount / totalHits) * 100 : 0,
+        avgResponseTimeMs: samples
+          ? Math.round(s.totalResponseTimeMs / samples)
+          : 0,
+        distinctRoutes: res?.distinctRoutes?.[0]?.count ?? 0,
+        topRoute: routes[0]
+          ? {
+              origin: routes[0].origin,
+              destination: routes[0].destination,
+              hits: routes[0].hits,
+            }
+          : null,
+        firstHit: s?.firstHit ?? null,
+        lastHit: s?.lastHit ?? null,
+      },
+      routes,
+      series: res?.series ?? [],
     };
   }
 
