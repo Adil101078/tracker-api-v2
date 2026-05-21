@@ -1,4 +1,11 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Logger,
+  Post,
+} from "@nestjs/common";
 import { CreateTrackerDto } from "./dto/create-tracker.dto";
 
 /**
@@ -17,9 +24,14 @@ import { CreateTrackerDto } from "./dto/create-tracker.dto";
  */
 @Controller("v1/admin/api-tracker")
 export class AdminReportController {
+  private readonly logger = new Logger(AdminReportController.name);
+
   @Post("create-report")
   @HttpCode(HttpStatus.ACCEPTED)
-  createReport(@Body() _dto: CreateTrackerDto) {
+  createReport(@Body() dto: CreateTrackerDto) {
+    this.logger.log(
+      `create-report: companyCode=${dto.companyCode} origin=${dto.origin ?? "-"} destination=${dto.destination ?? "-"}`,
+    );
     return { success: true, message: "Tracker accepted for processing" };
   }
 }

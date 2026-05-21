@@ -81,6 +81,32 @@ export class TrackerService {
     return (v && v.length ? v : 'unknown').replace(/[.$]/g, '_');
   }
 
+  /**
+   * BullMQ counts for the tracker queue — what's still in flight, what
+   * has finished, what failed. Useful for debugging ingestion backlog
+   * (e.g. if dashboard hits look stale, check `waiting` + `active`).
+   */
+  async queueStats() {
+    const counts = await this.trackerQueue.getJobCounts(
+      'waiting',
+      'active',
+      'completed',
+      'failed',
+      'delayed',
+      'paused',
+    );
+    const total =
+      (counts.waiting ?? 0) +
+      (counts.active ?? 0) +
+      (counts.delayed ?? 0) +
+      (counts.paused ?? 0);
+    return {
+      queue: constant.QUEUES.TRACKER,
+      counts,
+      pending: total,
+    };
+  }
+
   /** Enqueue an api-hit for async geo-enrichment + persistence. */
   async enqueue(dto: CreateTrackerDto): Promise<{ jobId: string }> {
     const job = await this.trackerQueue.add(

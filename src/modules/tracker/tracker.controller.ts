@@ -64,6 +64,14 @@ export class TrackerController {
     });
   }
 
+  /** BullMQ queue counts (waiting/active/completed/failed/...) — handy
+   *  for spotting ingestion backlog. */
+  @Get("queue-stats")
+  @SkipTracking()
+  queueStats() {
+    return this.trackerService.queueStats();
+  }
+
   // ---------- dashboard endpoints (not self-tracked) ----------
 
   @Get("stats/summary")
